@@ -57,7 +57,7 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
 /// is what lets a rename be a single `UPDATE models` with nothing to cascade.
 const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, \
      d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, \
-     p.shapes AS provider_shapes, d.shapes AS deployment_shapes, \
+     p.shapes AS provider_shapes, m.shapes AS model_shapes, d.shapes AS deployment_shapes, \
      d.upstream_model, d.upstream_format, d.weight, d.pricing, \
      d.health_check, d.health_path, d.created_at, d.updated_at, d.deleted_at";
 
@@ -70,7 +70,7 @@ const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.mode
      JOIN providers p ON p.id = d.provider_id";
 
 /// Column list for `models` reads.
-const MODEL_COLS: &str = "id, name, created_at, updated_at";
+const MODEL_COLS: &str = "id, name, shapes, created_at, updated_at";
 
 /// Column list for `providers` reads.
 const PROVIDER_COLS: &str = "id, name, api_base, api_key, extra, shapes, created_at, updated_at";
@@ -139,6 +139,7 @@ fn map_model(row: &SqliteRow) -> Result<ModelRecord> {
     Ok(ModelRecord {
         id: row.get("id"),
         name: row.get("name"),
+        shapes: dec_dep_shapes(row.get("shapes")),
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"))?,
     })
@@ -181,6 +182,7 @@ fn map_deployment(row: &SqliteRow) -> Result<DeploymentRecord> {
         health_path: row.get("health_path"),
         extra: dec_extra(row.get("extra")),
         shapes: dec_dep_shapes(row.get("deployment_shapes")),
+        model_shapes: dec_dep_shapes(row.get("model_shapes")),
         provider_shapes: dec_shapes(row.get("provider_shapes")),
         created_at: parse_ts(&row.get::<String, _>("created_at"))?,
         updated_at: parse_ts(&row.get::<String, _>("updated_at"))?,
@@ -1231,6 +1233,26 @@ impl Store for SqliteStore {
         .map_err(storage_err)?;
 
         tx.commit().await.map_err(storage_err)?;
+        self.get_model(id)
+            .await?
+            .ok_or_else(|| Error::NotFound("model".into()))
+    }
+
+    async fn set_model_shapes(
+        &self,
+        id: &str,
+        shapes: Option<&[yb_core::UpstreamFormat]>,
+    ) -> Result<ModelRecord> {
+        let done = sqlx::query("UPDATE models SET shapes = ?, updated_at = ? WHERE id = ?")
+            .bind(enc_dep_shapes(shapes))
+            .bind(ts(&now()))
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if done.rows_affected() == 0 {
+            return Err(Error::NotFound("model".into()));
+        }
         self.get_model(id)
             .await?
             .ok_or_else(|| Error::NotFound("model".into()))

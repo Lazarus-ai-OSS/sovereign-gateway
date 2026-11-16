@@ -611,7 +611,15 @@ async fn seed_models(
     for mc in models {
         // Once per block, before its deployments: a `[[model]]` that declares
         // only aliases still needs a model row for `seed_aliases` to target.
-        store.ensure_model(&mc.model_name).await?;
+        let model = store.ensure_model(&mc.model_name).await?;
+        if let Some(m_shapes) = &mc.shapes {
+            if m_shapes.is_empty() {
+                return Err(
+                    format!("model \"{}\" has an empty `shapes` array", mc.model_name).into(),
+                );
+            }
+            store.set_model_shapes(&model.id, Some(m_shapes)).await?;
+        }
         for dc in &mc.deployments {
             let provider = store.get_provider_by_name(&dc.provider).await?;
             let provider_fmts: Vec<yb_core::UpstreamFormat> = provider
@@ -640,9 +648,19 @@ async fn seed_models(
                     }
                 }
             }
+            let intersected_fmts: Vec<yb_core::UpstreamFormat> = match &mc.shapes {
+                Some(ms) if !provider_fmts.is_empty() => provider_fmts
+                    .iter()
+                    .copied()
+                    .filter(|f| ms.contains(f))
+                    .collect(),
+                Some(ms) => ms.clone(),
+                None => provider_fmts.clone(),
+            };
             let upstream_format = dc
                 .upstream_format
                 .or_else(|| dc.shapes.as_deref().and_then(yb_core::default_upstream_format))
+                .or_else(|| yb_core::default_upstream_format(&intersected_fmts))
                 .or_else(|| yb_core::default_upstream_format(&provider_fmts))
                 .ok_or_else(|| {
                     format!(

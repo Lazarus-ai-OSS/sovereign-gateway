@@ -349,6 +349,7 @@ mod tests {
             health_path: path.map(str::to_string),
             extra: Default::default(),
             shapes: None,
+            model_shapes: None,
             provider_shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),

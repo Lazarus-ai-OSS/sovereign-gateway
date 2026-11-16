@@ -555,11 +555,13 @@ const SHAPES: [string, string][] = SHAPE_GROUPS.flatMap(([, items]) => items);
 /** Effective `{ format, api_base }` list for a deployment row, mirroring `yb_core::resolve_effective_shapes`. */
 const effectiveShapesFor = (dep: any): { format: string; api_base: string | null }[] => {
   const pShapes: any[] = dep.provider_shapes || [];
+  const mShapes: string[] | null = dep.model_shapes || null;
   const dShapes: string[] | null = dep.shapes || null;
   const baseOf = (ps: any) => (ps.api_base && ps.api_base.trim()) ? ps.api_base.trim() : (dep.api_base || null);
+  const allows = (fmt: string) => (!mShapes || mShapes.includes(fmt)) && (!dShapes || dShapes.includes(fmt));
   if (pShapes.length > 0) {
-    if (dShapes) {
-      return pShapes.filter((ps) => dShapes.includes(ps.format)).map((ps) => ({ format: ps.format, api_base: baseOf(ps) }));
+    if (mShapes || dShapes) {
+      return pShapes.filter((ps) => allows(ps.format)).map((ps) => ({ format: ps.format, api_base: baseOf(ps) }));
     }
     const fmt = dep.upstream_format || '';
     const isNonLlm = fmt.endsWith('_embed') || fmt.startsWith('openai_images') || fmt.startsWith('openai_speech') || fmt.startsWith('openai_transcription') || fmt.startsWith('openai_videos');
@@ -567,6 +569,12 @@ const effectiveShapesFor = (dep: any): { format: string; api_base: string | null
       return [{ format: fmt, api_base: dep.api_base || null }];
     }
     return pShapes.map((ps) => ({ format: ps.format, api_base: baseOf(ps) }));
+  }
+  if (mShapes && dShapes) {
+    return mShapes.filter((fmt) => dShapes.includes(fmt)).map((fmt) => ({ format: fmt, api_base: dep.api_base || null }));
+  }
+  if (mShapes && mShapes.length > 0) {
+    return mShapes.map((fmt) => ({ format: fmt, api_base: dep.api_base || null }));
   }
   if (dShapes && dShapes.length > 0) {
     return dShapes.map((fmt) => ({ format: fmt, api_base: dep.api_base || null }));
@@ -733,6 +741,8 @@ function Models({ admin }: { admin: boolean }) {
   const [discoverFmt, setDiscoverFmt] = useState<string>('openai_chat');
   const [editingDep, setEditingDep] = useState<any | null>(null);
   const [editDepShapes, setEditDepShapes] = useState<Record<string, boolean>>({});
+  const [editingModel, setEditingModel] = useState<any | null>(null);
+  const [editModelShapes, setEditModelShapes] = useState<Record<string, boolean>>({});
   const [editMsg, setEditMsg] = useState('');
   const [msg, setMsg] = useState('');
   const selectedProvider = (providerData || []).find((x) => x.name === f.provider);
@@ -841,6 +851,37 @@ function Models({ admin }: { admin: boolean }) {
       reload(); reloadModels();
     } catch (e: any) { setEditMsg(e.message); }
   };
+  const openEditModelShapes = (model: any) => {
+    const mShapes: string[] | null = model.shapes || null;
+    const next: Record<string, boolean> = {};
+    if (mShapes && mShapes.length > 0) {
+      for (const fmt of mShapes) next[fmt] = true;
+    } else {
+      const union = new Set<string>();
+      for (const d of deploymentsFor(model.id)) {
+        for (const s of effectiveShapesFor(d)) union.add(s.format);
+      }
+      for (const fmt of union) next[fmt] = true;
+    }
+    setEditModelShapes(next);
+    setEditMsg('');
+    setEditingModel(model);
+  };
+  const saveEditModelShapes = async (unconstrain?: boolean) => {
+    if (!editingModel) return;
+    setEditMsg('');
+    let shapes: string[] | null = null;
+    if (!unconstrain) {
+      const checked = SHAPES.map(([k]) => k).filter((k) => editModelShapes[k]);
+      if (!checked.length) { setEditMsg('enable at least one API shape (or click Inherit all)'); return; }
+      shapes = checked;
+    }
+    try {
+      await api('/models/' + encodeURIComponent(editingModel.id) + '/shapes', { method: 'PUT', body: { shapes } });
+      setEditingModel(null);
+      reloadModels(); reload();
+    } catch (e: any) { setEditMsg(e.message); }
+  };
   const del = async (id: string) => { if (confirm('Delete this deployment?')) { await api('/deployments/' + id, { method: 'DELETE' }); reload(); reloadModels(); reloadProviders(); } };
   // Cached results only: opening the page must not call every upstream, which
   // would cost real tokens on every render.
@@ -911,6 +952,10 @@ function Models({ admin }: { admin: boolean }) {
                             <span key={a.alias} class="pill mono">{a.alias}{admin && <a class="x" title="Remove alias" onClick={() => delAlias(a.alias)}>×</a>}</span>
                           ))}
                           {admin && <a onClick={() => addAlias(model.name)} style="cursor:pointer" class="mut">+ alias</a>}
+                          {(model.shapes || []).map((fmt: string) => (
+                            <span key={'ms-' + fmt} class="pill mono" title="Model-level supported API shape">{fmt}</span>
+                          ))}
+                          {admin && <a onClick={() => openEditModelShapes(model)} style="cursor:pointer" class="mut">shapes</a>}
                         </div>
                       </td>
                     </tr>
@@ -1095,6 +1140,32 @@ function Models({ admin }: { admin: boolean }) {
           </div>
           <div class="row" style="margin-top:14px">
             <button class="btn" onClick={saveEditDep}>Save shapes</button>
+            {editMsg && <span class="err">{editMsg}</span>}
+          </div>
+        </Modal>
+      )}
+      {admin && editingModel && (
+        <Modal title={`Model API shapes — ${editingModel.name}`} onClose={() => setEditingModel(null)}>
+          <div class="mut" style="font-size:12px;margin-bottom:8px">
+            Select which API shapes <span class="mono">{editingModel.name}</span> supports. Each deployment serves the intersection of its provider’s shapes and the model’s shapes.
+          </div>
+          {SHAPE_GROUPS.map(([group, items]) => (
+            <div key={group} style="margin-top:10px">
+              <div class="mono mut" style="font-size:11px;text-transform:uppercase;letter-spacing:0.04em;margin-bottom:4px">{group}</div>
+              <div class="pills">
+                {items.map(([k, label]) => (
+                  <label key={k} class="row" style="gap:6px;cursor:pointer;margin-right:12px;margin-top:4px" title={label}>
+                    <input type="checkbox" checked={!!editModelShapes[k]}
+                           onChange={(e: any) => setEditModelShapes((s) => ({ ...s, [k]: e.target.checked }))} />
+                    <span class="mono">{k}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          ))}
+          <div class="row" style="margin-top:14px;gap:8px">
+            <button class="btn" onClick={() => saveEditModelShapes(false)}>Save model shapes</button>
+            <button class="ghost" onClick={() => saveEditModelShapes(true)}>Inherit all from provider</button>
             {editMsg && <span class="err">{editMsg}</span>}
           </div>
         </Modal>

@@ -1207,3 +1207,70 @@ async fn the_log_level_is_unset_until_one_is_kept() {
         assert_eq!(store.log_level().await.unwrap(), Some(level));
     }
 }
+
+#[tokio::test]
+async fn model_shapes_roundtrip_and_intersect_with_provider_shapes() {
+    use yb_core::{DecisionFormat, ProviderShape, UpstreamFormat, WireFormat};
+    let Some((store, _db)) = fresh_store().await else {
+        return;
+    };
+    store
+        .seed_deployment(&new_dep("chat-only", "sakura-gw"))
+        .await
+        .unwrap();
+    let p = store
+        .get_provider_by_name("sakura-gw")
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .set_provider_shapes(
+            &p.id,
+            &[
+                ProviderShape {
+                    format: WireFormat::OpenaiChat.into(),
+                    api_base: Some("http://sakura/v1".into()),
+                },
+                ProviderShape {
+                    format: WireFormat::Anthropic.into(),
+                    api_base: Some("http://sakura/anthropic".into()),
+                },
+                ProviderShape {
+                    format: DecisionFormat::Jev.into(),
+                    api_base: Some("http://sakura/v1".into()),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+    let m = store.get_model_by_name("chat-only").await.unwrap().unwrap();
+    assert_eq!(m.shapes, None);
+
+    let m_shapes: Vec<UpstreamFormat> =
+        vec![WireFormat::OpenaiChat.into(), WireFormat::Anthropic.into()];
+    let updated_m = store
+        .set_model_shapes(&m.id, Some(&m_shapes))
+        .await
+        .unwrap();
+    assert_eq!(updated_m.shapes, Some(m_shapes.clone()));
+
+    let dep = store.list_deployments().await.unwrap().pop().unwrap();
+    assert_eq!(dep.model_shapes, Some(m_shapes));
+    assert_eq!(
+        dep.effective_shapes(),
+        vec![
+            (WireFormat::OpenaiChat.into(), Some("http://sakura/v1")),
+            (
+                WireFormat::Anthropic.into(),
+                Some("http://sakura/anthropic")
+            ),
+        ]
+    );
+
+    // Clearing model shapes restores full inheritance from the provider.
+    let cleared = store.set_model_shapes(&m.id, None).await.unwrap();
+    assert_eq!(cleared.shapes, None);
+    let dep = store.list_deployments().await.unwrap().pop().unwrap();
+    assert_eq!(dep.effective_shapes().len(), 3);
+}

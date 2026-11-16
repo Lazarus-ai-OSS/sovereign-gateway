@@ -321,6 +321,11 @@ impl Extra {
 pub struct ModelRecord {
     pub id: crate::ids::Id,
     pub name: String,
+    /// Optional model-level API shapes (`None` = unconstrained by the model
+    /// entity; `Some(list)` = the model supports only these shapes, intersected
+    /// with each backing provider's `shapes`).
+    #[serde(default)]
+    pub shapes: Option<Vec<UpstreamFormat>>,
     pub created_at: crate::ids::Timestamp,
     pub updated_at: crate::ids::Timestamp,
 }
@@ -387,13 +392,21 @@ impl ProviderRecord {
 
 /// Resolve the effective `(format, api_base)` pairs served by a deployment.
 ///
-/// - When `provider_shapes` is non-empty, it defines the ceiling of shapes the
-///   provider supports (and each shape's `api_base`). `deployment_shapes = None`
-///   inherits all of them; `Some(filter)` narrows to the subset in `filter`.
+/// - `provider_shapes` defines the transport shapes the provider endpoint serves
+///   (and each shape's `api_base`).
+/// - `model_shapes` defines the API shapes the logical model supports (`None` =
+///   unconstrained at the model level).
+/// - `deployment_shapes` is an optional per-deployment narrowing override.
+/// - When `provider_shapes` is non-empty and either `model_shapes` or
+///   `deployment_shapes` is `Some`, the effective shapes are the intersection
+///   `provider_shapes ∩ model_shapes ∩ deployment_shapes` (carrying the
+///   provider's per-shape `api_base`).
 /// - When `provider_shapes` is empty (legacy provider with no checkboxes set),
-///   `deployment_shapes = None` falls back to `[(upstream_format, api_base)]`.
+///   `model_shapes` and `deployment_shapes` are intersected at `api_base`,
+///   falling back to `[(upstream_format, api_base)]` when both are `None`.
 pub fn resolve_effective_shapes<'a>(
     provider_shapes: &'a [ProviderShape],
+    model_shapes: Option<&'a [UpstreamFormat]>,
     deployment_shapes: Option<&'a [UpstreamFormat]>,
     upstream_format: UpstreamFormat,
     api_base: Option<&'a str>,
@@ -404,32 +417,42 @@ pub fn resolve_effective_shapes<'a>(
             .filter(|b| !b.trim().is_empty())
             .or(api_base)
     };
+    let allows = |fmt: UpstreamFormat| -> bool {
+        model_shapes.is_none_or(|m| m.contains(&fmt))
+            && deployment_shapes.is_none_or(|d| d.contains(&fmt))
+    };
     if !provider_shapes.is_empty() {
-        match deployment_shapes {
-            Some(filter) => provider_shapes
+        if model_shapes.is_some() || deployment_shapes.is_some() {
+            provider_shapes
                 .iter()
-                .filter(|ps| filter.contains(&ps.format))
+                .filter(|ps| allows(ps.format))
                 .map(|ps| (ps.format, shape_base(ps)))
-                .collect(),
-            None => {
-                if matches!(
-                    upstream_format,
-                    UpstreamFormat::Embed(_) | UpstreamFormat::Media(_)
-                ) && !provider_shapes.iter().any(|ps| {
-                    std::mem::discriminant(&ps.format) == std::mem::discriminant(&upstream_format)
-                }) {
-                    return vec![(upstream_format, api_base)];
-                }
-                provider_shapes
-                    .iter()
-                    .map(|ps| (ps.format, shape_base(ps)))
-                    .collect()
+                .collect()
+        } else {
+            if matches!(
+                upstream_format,
+                UpstreamFormat::Embed(_) | UpstreamFormat::Media(_)
+            ) && !provider_shapes.iter().any(|ps| {
+                std::mem::discriminant(&ps.format) == std::mem::discriminant(&upstream_format)
+            }) {
+                return vec![(upstream_format, api_base)];
             }
+            provider_shapes
+                .iter()
+                .map(|ps| (ps.format, shape_base(ps)))
+                .collect()
         }
     } else {
-        match deployment_shapes {
-            Some(filter) => filter.iter().map(|&f| (f, api_base)).collect(),
-            None => vec![(upstream_format, api_base)],
+        match (model_shapes, deployment_shapes) {
+            (Some(m), Some(d)) => m
+                .iter()
+                .copied()
+                .filter(|f| d.contains(f))
+                .map(|f| (f, api_base))
+                .collect(),
+            (Some(m), None) => m.iter().copied().map(|f| (f, api_base)).collect(),
+            (None, Some(d)) => d.iter().copied().map(|f| (f, api_base)).collect(),
+            (None, None) => vec![(upstream_format, api_base)],
         }
     }
 }
@@ -491,10 +514,12 @@ pub struct Deployment {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
-    /// Optional per-deployment shape filter (`None` = inherit all of
-    /// `provider_shapes`).
+    /// Optional per-deployment shape filter (`None` = inherit `provider_shapes ∩ model_shapes`).
     #[serde(default)]
     pub shapes: Option<Vec<UpstreamFormat>>,
+    /// Optional model-level API shapes, joined from `models.shapes` at read time.
+    #[serde(default)]
+    pub model_shapes: Option<Vec<UpstreamFormat>>,
     /// The provider's natively served API shapes, joined at read time.
     #[serde(default)]
     pub provider_shapes: Vec<ProviderShape>,
@@ -505,6 +530,7 @@ impl Deployment {
     pub fn effective_shapes(&self) -> Vec<(UpstreamFormat, Option<&str>)> {
         resolve_effective_shapes(
             &self.provider_shapes,
+            self.model_shapes.as_deref(),
             self.shapes.as_deref(),
             self.upstream_format,
             self.api_base.as_deref(),
@@ -638,10 +664,12 @@ pub struct DeploymentRecord {
     /// Open-ended per-deployment extras (see [`Extra`]).
     #[serde(default)]
     pub extra: Extra,
-    /// Optional per-deployment shape subset (`None` = inherit all of
-    /// `provider_shapes`).
+    /// Optional per-deployment shape subset (`None` = inherit `provider_shapes ∩ model_shapes`).
     #[serde(default)]
     pub shapes: Option<Vec<UpstreamFormat>>,
+    /// Optional model-level API shapes, joined from `models.shapes` at read time.
+    #[serde(default)]
+    pub model_shapes: Option<Vec<UpstreamFormat>>,
     /// The provider's natively served API shapes, joined at read time.
     #[serde(default)]
     pub provider_shapes: Vec<ProviderShape>,
@@ -655,6 +683,7 @@ impl DeploymentRecord {
     pub fn effective_shapes(&self) -> Vec<(UpstreamFormat, Option<&str>)> {
         resolve_effective_shapes(
             &self.provider_shapes,
+            self.model_shapes.as_deref(),
             self.shapes.as_deref(),
             self.upstream_format,
             self.api_base.as_deref(),
@@ -678,6 +707,7 @@ impl DeploymentRecord {
             health_path: self.health_path.clone(),
             extra: self.extra.clone(),
             shapes: self.shapes.clone(),
+            model_shapes: self.model_shapes.clone(),
             provider_shapes: self.provider_shapes.clone(),
         }
     }
@@ -749,8 +779,46 @@ mod shape_tests {
             health_path: None,
             extra: Extra::default(),
             shapes,
+            model_shapes: None,
             provider_shapes,
         }
+    }
+
+    #[test]
+    fn model_shapes_intersect_with_provider_shapes_taking_provider_bases() {
+        let base = Some("https://gw/v1");
+        let p_shapes = vec![
+            ProviderShape {
+                format: WireFormat::Anthropic.into(),
+                api_base: Some("https://gw/anthropic".into()),
+            },
+            ProviderShape {
+                format: WireFormat::OpenaiChat.into(),
+                api_base: None,
+            },
+            ProviderShape {
+                format: DecisionFormat::Jev.into(),
+                api_base: None,
+            },
+        ];
+
+        // A chat-only model deployed on a multi-shape gateway provider only
+        // exposes the intersection (`anthropic` at the provider's custom base
+        // and `openai_chat` at the provider's default base), never `jev`.
+        let mut chat_model_dep = mk_dep(WireFormat::OpenaiChat.into(), base, p_shapes, None);
+        chat_model_dep.model_shapes = Some(vec![
+            WireFormat::Anthropic.into(),
+            WireFormat::OpenaiChat.into(),
+        ]);
+        assert_eq!(
+            chat_model_dep.chat_target(WireFormat::Anthropic),
+            Some((WireFormat::Anthropic, Some("https://gw/anthropic"), true))
+        );
+        assert_eq!(
+            chat_model_dep.chat_target(WireFormat::OpenaiChat),
+            Some((WireFormat::OpenaiChat, base, true))
+        );
+        assert_eq!(chat_model_dep.decision_target(DecisionFormat::Jev), None);
     }
 
     #[test]

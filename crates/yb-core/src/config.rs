@@ -447,6 +447,10 @@ fn default_weight() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub model_name: String,
+    /// Optional model-level API shapes (`None` = unconstrained at the model
+    /// level; `Some(list)` = intersected with each provider's `shapes`).
+    #[serde(default)]
+    pub shapes: Option<Vec<UpstreamFormat>>,
     pub deployments: Vec<DeploymentConfig>,
     /// Other public names that resolve to this model (e.g. `["gpt-4", "fast"]`).
     #[serde(default)]

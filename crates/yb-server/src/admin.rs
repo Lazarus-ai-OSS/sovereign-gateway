@@ -64,6 +64,7 @@ pub fn router() -> Router<AppState> {
         // models (the entity: a public name, its aliases, its deployments)
         .route("/models", get(list_models).post(create_model))
         .route("/models/:id/name", put(rename_model))
+        .route("/models/:id/shapes", put(update_model_shapes))
         // deployments (one model's upstream fan-out)
         .route(
             "/deployments",
@@ -966,6 +967,28 @@ fn validate_shapes(shapes: Option<&[yb_core::ProviderShape]>) -> std::result::Re
     Ok(())
 }
 
+fn validate_model_shapes(
+    shapes: Option<&[yb_core::UpstreamFormat]>,
+) -> std::result::Result<(), Response> {
+    let Some(list) = shapes else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(error_response(&Error::BadRequest(
+            "model must enable at least one API shape".into(),
+        )));
+    }
+    for (i, &fmt) in list.iter().enumerate() {
+        if list[..i].contains(&fmt) {
+            return Err(error_response(&Error::BadRequest(format!(
+                "shape {} is listed twice",
+                fmt.as_str()
+            ))));
+        }
+    }
+    Ok(())
+}
+
 fn validate_deployment_shapes(
     shapes: Option<&[yb_core::UpstreamFormat]>,
     provider: Option<&yb_core::ProviderRecord>,
@@ -1005,12 +1028,29 @@ fn validate_deployment_shapes(
 fn resolve_deployment_upstream_format(
     explicit: Option<yb_core::UpstreamFormat>,
     shapes: Option<&[yb_core::UpstreamFormat]>,
+    model_shapes: Option<&[yb_core::UpstreamFormat]>,
     provider: Option<&yb_core::ProviderRecord>,
 ) -> std::result::Result<yb_core::UpstreamFormat, Response> {
     if let Some(f) = explicit {
         return Ok(f);
     }
     if let Some(f) = shapes.and_then(yb_core::default_upstream_format) {
+        return Ok(f);
+    }
+    if let (Some(ms), Some(p)) = (model_shapes, provider) {
+        if !p.shapes.is_empty() {
+            let inter: Vec<yb_core::UpstreamFormat> = p
+                .shapes
+                .iter()
+                .map(|s| s.format)
+                .filter(|f| ms.contains(f))
+                .collect();
+            if let Some(f) = yb_core::default_upstream_format(&inter) {
+                return Ok(f);
+            }
+        }
+    }
+    if let Some(f) = model_shapes.and_then(yb_core::default_upstream_format) {
         return Ok(f);
     }
     if let Some(p) = provider {
@@ -1020,7 +1060,8 @@ fn resolve_deployment_upstream_format(
         }
     }
     Err(error_response(&Error::BadRequest(
-        "upstream_format is required when neither provider nor deployment declares shapes".into(),
+        "upstream_format is required when neither provider, model, nor deployment declares shapes"
+            .into(),
     )))
 }
 
@@ -1277,6 +1318,7 @@ async fn create_deployments_bulk(
     let upstream_format = match resolve_deployment_upstream_format(
         body.upstream_format,
         body.shapes.as_deref(),
+        None,
         provider_rec.as_ref(),
     ) {
         Ok(f) => f,
@@ -1381,6 +1423,7 @@ async fn list_models(principal: Principal, State(state): State<AppState>) -> Res
             json!({
                 "id": m.id,
                 "name": m.name,
+                "shapes": m.shapes,
                 "aliases": names,
                 "deployment_count": deployments.iter().filter(|d| d.model_id == m.id).count(),
                 "created_at": m.created_at,
@@ -1453,6 +1496,8 @@ async fn rename_model(
 #[derive(Deserialize)]
 struct CreateModelEntityBody {
     name: String,
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
 }
 
 /// `POST /models` — create a model by name, with no deployments yet (admin only).
@@ -1474,14 +1519,59 @@ async fn create_model(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Err(r) = validate_model_shapes(body.shapes.as_deref()) {
+        return r;
+    }
     let rec = match state.store.ensure_model(&name).await {
         Ok(r) => r,
         Err(e) => return error_response(&e),
+    };
+    let rec = match &body.shapes {
+        Some(shapes) => match state.store.set_model_shapes(&rec.id, Some(shapes)).await {
+            Ok(r) => r,
+            Err(e) => return error_response(&e),
+        },
+        None => rec,
     };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
     }
     respond(Ok(rec))
+}
+
+#[derive(Deserialize)]
+struct UpdateModelShapesBody {
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
+}
+
+/// `PUT /models/:id/shapes` — edit the API shapes a model supports (`None` =
+/// unconstrained by the model entity; `Some(list)` = intersected with each
+/// provider's `shapes`) and hot-reload (admin only).
+async fn update_model_shapes(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateModelShapesBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    if let Err(r) = validate_model_shapes(body.shapes.as_deref()) {
+        return r;
+    }
+    let updated = match state
+        .store
+        .set_model_shapes(&id, body.shapes.as_deref())
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(updated))
 }
 
 /// `POST /deployments` — add a deployment and hot-reload the router (admin only).
@@ -1508,12 +1598,17 @@ async fn create_deployment(
         Ok(p) => p,
         Err(e) => return error_response(&e),
     };
+    let model_rec = match state.store.get_model_by_name(&model_name).await {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
     if let Err(r) = validate_deployment_shapes(body.shapes.as_deref(), provider_rec.as_ref()) {
         return r;
     }
     let upstream_format = match resolve_deployment_upstream_format(
         body.upstream_format,
         body.shapes.as_deref(),
+        model_rec.as_ref().and_then(|m| m.shapes.as_deref()),
         provider_rec.as_ref(),
     ) {
         Ok(f) => f,

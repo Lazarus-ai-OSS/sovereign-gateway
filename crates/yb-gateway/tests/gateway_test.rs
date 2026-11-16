@@ -321,6 +321,13 @@ impl Store for RecordingStore {
     async fn rename_model(&self, _id: &str, _new_name: &str) -> Result<yb_core::ModelRecord> {
         unimplemented!("RecordingStore only serves the request path")
     }
+    async fn set_model_shapes(
+        &self,
+        _id: &str,
+        _shapes: Option<&[yb_core::UpstreamFormat]>,
+    ) -> Result<yb_core::ModelRecord> {
+        unimplemented!("RecordingStore only serves the request path")
+    }
     async fn list_aliases(&self) -> Result<Vec<yb_core::ModelAlias>> {
         Ok(vec![])
     }
@@ -337,6 +344,7 @@ impl Store for RecordingStore {
 fn test_router() -> DeploymentRouter {
     let models = vec![ModelConfig {
         model_name: "my-model".into(),
+        shapes: None,
         aliases: vec![],
         deployments: vec![DeploymentConfig {
             provider: "openai".into(),
@@ -358,6 +366,7 @@ fn test_router() -> DeploymentRouter {
 fn responses_router() -> DeploymentRouter {
     let models = vec![ModelConfig {
         model_name: "fake-responses".into(),
+        shapes: None,
         aliases: vec![],
         deployments: vec![DeploymentConfig {
             provider: "fake".into(),
@@ -471,6 +480,7 @@ async fn native_responses_eof_without_terminal_is_a_stream_error() {
 async fn responses_route_replays_request_body_except_the_model_id() {
     let models = vec![ModelConfig {
         model_name: "client-alias".into(),
+        shapes: None,
         aliases: vec![],
         deployments: vec![DeploymentConfig {
             provider: "fake".into(),
@@ -720,6 +730,7 @@ fn embed_router() -> DeploymentRouter {
     let models = vec![
         ModelConfig {
             model_name: "my-embed".into(),
+            shapes: None,
             aliases: vec![],
             deployments: vec![DeploymentConfig {
                 provider: "openai".into(),
@@ -737,6 +748,7 @@ fn embed_router() -> DeploymentRouter {
         },
         ModelConfig {
             model_name: "my-model".into(),
+            shapes: None,
             aliases: vec![],
             deployments: vec![DeploymentConfig {
                 provider: "openai".into(),
@@ -921,6 +933,7 @@ async fn kind_mismatch_is_a_clean_400_both_ways() {
 fn media_router() -> DeploymentRouter {
     let deployment = |name: &str, upstream: &str, format: yb_core::MediaFormat| ModelConfig {
         model_name: name.into(),
+        shapes: None,
         aliases: vec![],
         deployments: vec![DeploymentConfig {
             provider: "host-agent".into(),
@@ -1147,6 +1160,7 @@ async fn a_video_is_found_on_the_deployment_that_made_it() {
     let router = DeploymentRouter::from_models(
         vec![ModelConfig {
             model_name: "video".into(),
+            shapes: None,
             aliases: vec![],
             deployments: vec![deployment("engine-one"), deployment("engine-two")],
         }],
@@ -1307,6 +1321,7 @@ async fn an_unreachable_video_engine_is_passed_over() {
         let router = DeploymentRouter::from_models(
             vec![ModelConfig {
                 model_name: "video".into(),
+                shapes: None,
                 aliases: vec![],
                 deployments: vec![deployment("engine-one"), deployment("engine-two")],
             }],
@@ -1356,6 +1371,7 @@ fn shaped_router(own: WireFormat, shapes: &[(WireFormat, Option<&str>)]) -> Depl
         health_path: None,
         extra: Default::default(),
         shapes: None,
+        model_shapes: None,
         provider_shapes: shapes
             .iter()
             .map(|(f, b)| yb_core::ProviderShape {
@@ -1541,6 +1557,7 @@ async fn a_deployment_serving_the_clients_shape_is_tried_first() {
         health_path: None,
         extra: Default::default(),
         shapes: None,
+        model_shapes: None,
         provider_shapes: Vec::new(),
         created_at: now(),
         updated_at: now(),
@@ -1671,6 +1688,7 @@ async fn systemone_jev_same_shape_relays_bytes_and_meters_usage() {
         health_path: None,
         extra: Default::default(),
         shapes: None,
+        model_shapes: None,
         provider_shapes: vec![
             yb_core::ProviderShape {
                 format: WireFormat::OpenaiChat.into(),
@@ -1760,6 +1778,7 @@ async fn decisions_and_jev_translate_envelopes_across_decision_shapes() {
         health_path: None,
         extra: Default::default(),
         shapes: None,
+        model_shapes: None,
         provider_shapes: vec![yb_core::ProviderShape {
             format: yb_core::DecisionFormat::Jev.into(),
             api_base: None,
@@ -1830,6 +1849,7 @@ async fn decisions_and_jev_translate_envelopes_across_decision_shapes() {
         health_path: None,
         extra: Default::default(),
         shapes: None,
+        model_shapes: None,
         provider_shapes: vec![yb_core::ProviderShape {
             format: yb_core::DecisionFormat::Decisions.into(),
             api_base: None,
@@ -1897,7 +1917,8 @@ async fn provider_shapes_route_chat_embed_and_jev_with_per_shape_bases_and_narro
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        shapes: Some(vec![
+        shapes: None,
+        model_shapes: Some(vec![
             WireFormat::Anthropic.into(),
             WireFormat::OpenaiChat.into(),
         ]),
@@ -1921,7 +1942,8 @@ async fn provider_shapes_route_chat_embed_and_jev_with_per_shape_bases_and_narro
         health_check: Default::default(),
         health_path: None,
         extra: Default::default(),
-        shapes: Some(vec![yb_core::EmbedFormat::OpenaiEmbed.into()]),
+        shapes: None,
+        model_shapes: Some(vec![yb_core::EmbedFormat::OpenaiEmbed.into()]),
         provider_shapes,
         created_at: now(),
         updated_at: now(),

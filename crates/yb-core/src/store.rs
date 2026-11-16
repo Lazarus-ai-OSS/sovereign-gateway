@@ -142,6 +142,14 @@ pub trait Store: Send + Sync {
     /// *this* model, that alias is consumed rather than conflicting — so
     /// undoing a rename leaves no self-referential alias behind.
     async fn rename_model(&self, id: &str, new_name: &str) -> crate::Result<ModelRecord>;
+    /// Update the API shapes a model supports (`None` = unconstrained at the
+    /// model level; `Some(list)` = intersected with each backing provider's
+    /// `shapes`).
+    async fn set_model_shapes(
+        &self,
+        id: &str,
+        shapes: Option<&[crate::routing::UpstreamFormat]>,
+    ) -> crate::Result<ModelRecord>;
 
     // ---- providers (an endpoint, its credentials, its deployments) -----
     async fn list_providers(&self) -> crate::Result<Vec<ProviderRecord>>;

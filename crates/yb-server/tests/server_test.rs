@@ -78,6 +78,7 @@ async fn setup() -> (AppState, String) {
 
     let models = vec![ModelConfig {
         model_name: "my-model".into(),
+        shapes: None,
         aliases: vec![],
         deployments: vec![DeploymentConfig {
             provider: "openai".into(),
@@ -2429,6 +2430,28 @@ async fn multi_family_provider_shapes_deployment_narrowing_and_systemone_routes_
     .await;
     assert_eq!(status, StatusCode::OK, "{narrowed:?}");
     assert_eq!(narrowed["shapes"], json!(["jev"]));
+
+    // Also verify model-level shapes (`PUT /admin/v1/models/:id/shapes`): clearing
+    // `dep.shapes` (`null`) and setting `model.shapes = ["jev"]` restricts the
+    // model to `jev` across the multi-shape provider while inheriting `https://s1.z.test/v1`.
+    let model_id = dep_body["model_id"].as_str().unwrap().to_string();
+    let (status, _) = put_json(
+        &app,
+        &format!("/admin/v1/deployments/{dep_id}"),
+        &cookie,
+        json!({ "shapes": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, m_updated) = put_json(
+        &app,
+        &format!("/admin/v1/models/{model_id}/shapes"),
+        &cookie,
+        json!({ "shapes": ["jev"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{m_updated:?}");
+    assert_eq!(m_updated["shapes"], json!(["jev"]));
 
     // 4. Call POST /v1/systemone and /jev/v1/systemone -> relays to https://s1.z.test/v1/systemone.
     for path in ["/v1/systemone", "/jev/v1/systemone"] {

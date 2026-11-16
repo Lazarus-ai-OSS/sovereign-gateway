@@ -124,11 +124,17 @@ impl DeploymentRouter {
             .into_iter()
             .flat_map(|mc| {
                 let model_id = cfg_model_id(&mc.model_name);
+                let model_shapes = mc.shapes.clone();
                 mc.deployments.into_iter().map(move |dc| {
                     let upstream_format = dc
                         .upstream_format
                         .or_else(|| {
                             dc.shapes
+                                .as_deref()
+                                .and_then(yb_core::default_upstream_format)
+                        })
+                        .or_else(|| {
+                            model_shapes
                                 .as_deref()
                                 .and_then(yb_core::default_upstream_format)
                         })
@@ -148,6 +154,7 @@ impl DeploymentRouter {
                         health_path: dc.health_path,
                         extra: dc.extra.clone(),
                         shapes: dc.shapes,
+                        model_shapes: model_shapes.clone(),
                         provider_shapes: Vec::new(),
                     }
                 })
@@ -380,6 +387,7 @@ mod tests {
         let models = vec![
             ModelConfig {
                 model_name: "smart".to_string(),
+                shapes: None,
                 aliases: vec![],
                 deployments: vec![
                     dc("openai", WireFormat::OpenaiChat, 1),
@@ -388,6 +396,7 @@ mod tests {
             },
             ModelConfig {
                 model_name: "cheap".to_string(),
+                shapes: None,
                 aliases: vec![],
                 deployments: vec![dc("openrouter", WireFormat::OpenaiChat, 1)],
             },
@@ -531,6 +540,7 @@ mod tests {
             health_path: None,
             extra: Default::default(),
             shapes: None,
+            model_shapes: None,
             provider_shapes: Vec::new(),
             created_at: yb_core::now(),
             updated_at: yb_core::now(),
