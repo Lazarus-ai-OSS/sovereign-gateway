@@ -64,13 +64,17 @@ pub fn router() -> Router<AppState> {
         // models (the entity: a public name, its aliases, its deployments)
         .route("/models", get(list_models).post(create_model))
         .route("/models/:id/name", put(rename_model))
+        .route("/models/:id/shapes", put(update_model_shapes))
         // deployments (one model's upstream fan-out)
         .route(
             "/deployments",
             get(list_deployments).post(create_deployment),
         )
         .route("/deployments/health", get(health_all_models))
-        .route("/deployments/:id", delete(delete_deployment))
+        .route(
+            "/deployments/:id",
+            put(update_deployment).delete(delete_deployment),
+        )
         .route("/deployments/:id/health", post(health_one_model))
         .route("/models/:id/health", post(health_model))
         .route("/health/last", get(last_health))
@@ -904,10 +908,13 @@ struct CreateModelBody {
     /// The provider to serve this through, by name.
     provider: String,
     upstream_model: String,
-    /// The upstream wire format — the deployment's only "adapter shape"
-    /// (a chat dialect like `openai_chat`, or an embeddings dialect like
-    /// `cohere_embed`).
-    upstream_format: yb_core::UpstreamFormat,
+    /// Optional primary/fallback upstream format. When omitted, derived from
+    /// `shapes` or the provider's configured `shapes`.
+    #[serde(default)]
+    upstream_format: Option<yb_core::UpstreamFormat>,
+    /// Optional per-deployment shape subset (`None` = inherit all provider shapes).
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
     #[serde(default)]
     weight: Option<u32>,
     #[serde(default)]
@@ -958,6 +965,104 @@ fn validate_shapes(shapes: Option<&[yb_core::ProviderShape]>) -> std::result::Re
         }
     }
     Ok(())
+}
+
+fn validate_model_shapes(
+    shapes: Option<&[yb_core::UpstreamFormat]>,
+) -> std::result::Result<(), Response> {
+    let Some(list) = shapes else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(error_response(&Error::BadRequest(
+            "model must enable at least one API shape".into(),
+        )));
+    }
+    for (i, &fmt) in list.iter().enumerate() {
+        if list[..i].contains(&fmt) {
+            return Err(error_response(&Error::BadRequest(format!(
+                "shape {} is listed twice",
+                fmt.as_str()
+            ))));
+        }
+    }
+    Ok(())
+}
+
+fn validate_deployment_shapes(
+    shapes: Option<&[yb_core::UpstreamFormat]>,
+    provider: Option<&yb_core::ProviderRecord>,
+) -> std::result::Result<(), Response> {
+    let Some(list) = shapes else {
+        return Ok(());
+    };
+    if list.is_empty() {
+        return Err(error_response(&Error::BadRequest(
+            "deployment must enable at least one API shape".into(),
+        )));
+    }
+    for (i, &fmt) in list.iter().enumerate() {
+        if list[..i].contains(&fmt) {
+            return Err(error_response(&Error::BadRequest(format!(
+                "shape {} is listed twice",
+                fmt.as_str()
+            ))));
+        }
+    }
+    if let Some(p) = provider {
+        if !p.shapes.is_empty() {
+            for &fmt in list {
+                if !p.shapes.iter().any(|ps| ps.format == fmt) {
+                    return Err(error_response(&Error::BadRequest(format!(
+                        "provider \"{}\" does not serve shape {}",
+                        p.name,
+                        fmt.as_str()
+                    ))));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_deployment_upstream_format(
+    explicit: Option<yb_core::UpstreamFormat>,
+    shapes: Option<&[yb_core::UpstreamFormat]>,
+    model_shapes: Option<&[yb_core::UpstreamFormat]>,
+    provider: Option<&yb_core::ProviderRecord>,
+) -> std::result::Result<yb_core::UpstreamFormat, Response> {
+    if let Some(f) = explicit {
+        return Ok(f);
+    }
+    if let Some(f) = shapes.and_then(yb_core::default_upstream_format) {
+        return Ok(f);
+    }
+    if let (Some(ms), Some(p)) = (model_shapes, provider) {
+        if !p.shapes.is_empty() {
+            let inter: Vec<yb_core::UpstreamFormat> = p
+                .shapes
+                .iter()
+                .map(|s| s.format)
+                .filter(|f| ms.contains(f))
+                .collect();
+            if let Some(f) = yb_core::default_upstream_format(&inter) {
+                return Ok(f);
+            }
+        }
+    }
+    if let Some(f) = model_shapes.and_then(yb_core::default_upstream_format) {
+        return Ok(f);
+    }
+    if let Some(p) = provider {
+        let fmts: Vec<yb_core::UpstreamFormat> = p.shapes.iter().map(|s| s.format).collect();
+        if let Some(f) = yb_core::default_upstream_format(&fmts) {
+            return Ok(f);
+        }
+    }
+    Err(error_response(&Error::BadRequest(
+        "upstream_format is required when neither provider, model, nor deployment declares shapes"
+            .into(),
+    )))
 }
 
 fn provider_json(p: &yb_core::ProviderRecord) -> serde_json::Value {
@@ -1135,7 +1240,7 @@ async fn discover_provider_models(
     let found = match state
         .gateway
         .discover_models(
-            provider.api_base.as_deref(),
+            provider.base_for(body.upstream_format),
             provider.api_key.as_deref(),
             &provider.extra,
             body.upstream_format,
@@ -1156,7 +1261,10 @@ async fn discover_provider_models(
             let deployed = existing.iter().any(|d| {
                 d.provider_id == provider.id
                     && d.upstream_model == upstream_model
-                    && d.upstream_format == body.upstream_format
+                    && (d.upstream_format == body.upstream_format
+                        || d.to_deployment()
+                            .native_base(body.upstream_format)
+                            .is_some())
             });
             json!({ "upstream_model": upstream_model, "deployed": deployed })
         })
@@ -1167,7 +1275,10 @@ async fn discover_provider_models(
 #[derive(Deserialize)]
 struct BulkDeploymentsBody {
     provider: String,
-    upstream_format: yb_core::UpstreamFormat,
+    #[serde(default)]
+    upstream_format: Option<yb_core::UpstreamFormat>,
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
     /// Each entry binds one upstream model to a public model name. The name may
     /// be an existing model or a new one — the store resolves it either way.
     models: Vec<BulkDeploymentEntry>,
@@ -1197,6 +1308,22 @@ async fn create_deployments_bulk(
         Ok(n) => n,
         Err(r) => return r,
     };
+    let provider_rec = match state.store.get_provider_by_name(&provider_name).await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(r) = validate_deployment_shapes(body.shapes.as_deref(), provider_rec.as_ref()) {
+        return r;
+    }
+    let upstream_format = match resolve_deployment_upstream_format(
+        body.upstream_format,
+        body.shapes.as_deref(),
+        None,
+        provider_rec.as_ref(),
+    ) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
     let mut created = 0usize;
     let mut skipped = 0usize;
     let mut errors: Vec<serde_json::Value> = Vec::new();
@@ -1213,7 +1340,8 @@ async fn create_deployments_bulk(
             model_name,
             provider_name: provider_name.clone(),
             upstream_model: entry.upstream_model.clone(),
-            upstream_format: body.upstream_format,
+            upstream_format,
+            shapes: body.shapes.clone(),
             weight: 1,
             pricing: None,
             health_check: Default::default(),
@@ -1295,6 +1423,7 @@ async fn list_models(principal: Principal, State(state): State<AppState>) -> Res
             json!({
                 "id": m.id,
                 "name": m.name,
+                "shapes": m.shapes,
                 "aliases": names,
                 "deployment_count": deployments.iter().filter(|d| d.model_id == m.id).count(),
                 "created_at": m.created_at,
@@ -1367,6 +1496,8 @@ async fn rename_model(
 #[derive(Deserialize)]
 struct CreateModelEntityBody {
     name: String,
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
 }
 
 /// `POST /models` — create a model by name, with no deployments yet (admin only).
@@ -1388,14 +1519,59 @@ async fn create_model(
         Ok(n) => n,
         Err(r) => return r,
     };
+    if let Err(r) = validate_model_shapes(body.shapes.as_deref()) {
+        return r;
+    }
     let rec = match state.store.ensure_model(&name).await {
         Ok(r) => r,
         Err(e) => return error_response(&e),
+    };
+    let rec = match &body.shapes {
+        Some(shapes) => match state.store.set_model_shapes(&rec.id, Some(shapes)).await {
+            Ok(r) => r,
+            Err(e) => return error_response(&e),
+        },
+        None => rec,
     };
     if let Err(e) = state.reload_models().await {
         return error_response(&e);
     }
     respond(Ok(rec))
+}
+
+#[derive(Deserialize)]
+struct UpdateModelShapesBody {
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
+}
+
+/// `PUT /models/:id/shapes` — edit the API shapes a model supports (`None` =
+/// unconstrained by the model entity; `Some(list)` = intersected with each
+/// provider's `shapes`) and hot-reload (admin only).
+async fn update_model_shapes(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateModelShapesBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    if let Err(r) = validate_model_shapes(body.shapes.as_deref()) {
+        return r;
+    }
+    let updated = match state
+        .store
+        .set_model_shapes(&id, body.shapes.as_deref())
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(updated))
 }
 
 /// `POST /deployments` — add a deployment and hot-reload the router (admin only).
@@ -1418,11 +1594,32 @@ async fn create_deployment(
         Ok(n) => n,
         Err(r) => return r,
     };
+    let provider_rec = match state.store.get_provider_by_name(&provider_name).await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    let model_rec = match state.store.get_model_by_name(&model_name).await {
+        Ok(m) => m,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(r) = validate_deployment_shapes(body.shapes.as_deref(), provider_rec.as_ref()) {
+        return r;
+    }
+    let upstream_format = match resolve_deployment_upstream_format(
+        body.upstream_format,
+        body.shapes.as_deref(),
+        model_rec.as_ref().and_then(|m| m.shapes.as_deref()),
+        provider_rec.as_ref(),
+    ) {
+        Ok(f) => f,
+        Err(r) => return r,
+    };
     let dep = yb_core::NewDeployment {
         model_name,
         provider_name,
         upstream_model: body.upstream_model,
-        upstream_format: body.upstream_format,
+        upstream_format,
+        shapes: body.shapes,
         weight: body.weight.unwrap_or(1),
         pricing: body.pricing,
         health_check: body.health_check,
@@ -1436,6 +1633,49 @@ async fn create_deployment(
         return error_response(&e);
     }
     respond(Ok(created))
+}
+
+#[derive(Deserialize)]
+struct UpdateDeploymentBody {
+    #[serde(default)]
+    shapes: Option<Vec<yb_core::UpstreamFormat>>,
+}
+
+/// `PUT /deployments/:id` — edit a deployment's enabled API shapes (`None`
+/// inherits all of its provider's shapes) and hot-reload (admin only).
+async fn update_deployment(
+    principal: Principal,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateDeploymentBody>,
+) -> Response {
+    if let Err(r) = authz(&principal, Action::EditConfig) {
+        return r;
+    }
+    let existing = match state.store.get_deployment(&id).await {
+        Ok(Some(d)) => d,
+        Ok(None) => return error_response(&Error::NotFound("deployment".into())),
+        Err(e) => return error_response(&e),
+    };
+    let provider = match state.store.get_provider(&existing.provider_id).await {
+        Ok(p) => p,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(r) = validate_deployment_shapes(body.shapes.as_deref(), provider.as_ref()) {
+        return r;
+    }
+    let updated = match state
+        .store
+        .set_deployment_shapes(&id, body.shapes.as_deref())
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => return error_response(&e),
+    };
+    if let Err(e) = state.reload_models().await {
+        return error_response(&e);
+    }
+    respond(Ok(updated))
 }
 
 /// `DELETE /deployments/:id` — soft-delete a deployment and hot-reload (admin only).

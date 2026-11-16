@@ -82,7 +82,8 @@ fn enc_enum<T: serde::Serialize>(v: &T) -> String {
 /// disagree, and the row is indexed with the wrong one. Naming the columns keeps
 /// reads pinned to the shape this code expects.
 const DEPLOYMENT_COLS: &str = "d.id, d.model_id, m.name AS model_name, \
-     d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, p.shapes, \
+     d.provider_id, p.name AS provider, p.api_base, p.api_key, p.extra, \
+     p.shapes AS provider_shapes, m.shapes AS model_shapes, d.shapes AS deployment_shapes, \
      d.upstream_model, d.upstream_format, d.weight, d.pricing, \
      d.health_check, d.health_path, d.created_at, d.updated_at, d.deleted_at";
 
@@ -91,7 +92,7 @@ const DEPLOYMENT_FROM: &str = "FROM deployments d JOIN models m ON m.id = d.mode
      JOIN providers p ON p.id = d.provider_id";
 
 /// Column list for `models` reads.
-const MODEL_COLS: &str = "id, name, created_at, updated_at";
+const MODEL_COLS: &str = "id, name, shapes, created_at, updated_at";
 
 /// Column list for `providers` reads.
 const PROVIDER_COLS: &str = "id, name, api_base, api_key, extra, shapes, created_at, updated_at";
@@ -120,6 +121,19 @@ fn dec_shapes(raw: Option<String>) -> Vec<yb_core::ProviderShape> {
         .filter(|s| !s.is_empty())
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_default()
+}
+
+/// Encode optional per-deployment shape subset (`None` → SQL NULL).
+fn enc_dep_shapes(s: Option<&[yb_core::UpstreamFormat]>) -> Option<String> {
+    s.map(|v| serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// Decode optional per-deployment `shapes` column (`NULL`/blank/invalid → `None`).
+fn dec_dep_shapes(raw: Option<String>) -> Option<Vec<yb_core::UpstreamFormat>> {
+    raw.as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| serde_json::from_str(s).ok())
 }
 
 /// Encode optional pricing as JSON text (`None` → SQL NULL).
@@ -251,6 +265,7 @@ fn map_model(r: &PgRow) -> Result<ModelRecord> {
     Ok(ModelRecord {
         id: r.try_get("id").map_err(storage_err)?,
         name: r.try_get("name").map_err(storage_err)?,
+        shapes: dec_dep_shapes(r.try_get("shapes").ok()),
         created_at: r.try_get("created_at").map_err(storage_err)?,
         updated_at: r.try_get("updated_at").map_err(storage_err)?,
     })
@@ -292,7 +307,9 @@ fn map_deployment(r: &PgRow) -> Result<DeploymentRecord> {
         .map_err(storage_err)?,
         health_path: r.try_get("health_path").map_err(storage_err)?,
         extra: dec_extra(r.try_get("extra").ok()),
-        shapes: dec_shapes(r.try_get("shapes").ok()),
+        shapes: dec_dep_shapes(r.try_get("deployment_shapes").ok()),
+        model_shapes: dec_dep_shapes(r.try_get("model_shapes").ok()),
+        provider_shapes: dec_shapes(r.try_get("provider_shapes").ok()),
         created_at: r.try_get("created_at").map_err(storage_err)?,
         updated_at: r.try_get("updated_at").map_err(storage_err)?,
         deleted_at: r.try_get("deleted_at").map_err(storage_err)?,
@@ -1194,6 +1211,26 @@ impl Store for PostgresStore {
             .ok_or_else(|| Error::NotFound("model".into()))
     }
 
+    async fn set_model_shapes(
+        &self,
+        id: &str,
+        shapes: Option<&[yb_core::UpstreamFormat]>,
+    ) -> Result<ModelRecord> {
+        let done = sqlx::query("UPDATE models SET shapes = $1, updated_at = $2 WHERE id = $3")
+            .bind(enc_dep_shapes(shapes))
+            .bind(now())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if done.rows_affected() == 0 {
+            return Err(Error::NotFound("model".into()));
+        }
+        self.get_model(id)
+            .await?
+            .ok_or_else(|| Error::NotFound("model".into()))
+    }
+
     // ---- providers (an endpoint, its credentials, its deployments) -----
     async fn list_providers(&self) -> Result<Vec<ProviderRecord>> {
         let rows = sqlx::query(&format!(
@@ -1352,15 +1389,16 @@ impl Store for PostgresStore {
         let id = new_id();
         sqlx::query(
             "INSERT INTO deployments (id, model_id, provider_id, upstream_model, \
-             upstream_format, weight, pricing, health_check, health_path, \
+             upstream_format, shapes, weight, pricing, health_check, health_path, \
              created_at, updated_at, deleted_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NULL)",
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULL)",
         )
         .bind(&id)
         .bind(&model.id)
         .bind(&provider.id)
         .bind(&dep.upstream_model)
         .bind(enc_enum(&dep.upstream_format))
+        .bind(enc_dep_shapes(dep.shapes.as_deref()))
         .bind(dep.weight as i32)
         .bind(enc_pricing(&dep.pricing))
         .bind(dep.health_check.as_str())
@@ -1371,6 +1409,29 @@ impl Store for PostgresStore {
         .await
         .map_err(storage_err)?;
         self.get_deployment(&id)
+            .await?
+            .ok_or_else(|| Error::NotFound("deployment".into()))
+    }
+
+    async fn set_deployment_shapes(
+        &self,
+        id: &str,
+        shapes: Option<&[yb_core::UpstreamFormat]>,
+    ) -> Result<DeploymentRecord> {
+        let done = sqlx::query(
+            "UPDATE deployments SET shapes = $1, updated_at = $2 \
+             WHERE id = $3 AND deleted_at IS NULL",
+        )
+        .bind(enc_dep_shapes(shapes))
+        .bind(now())
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        if done.rows_affected() == 0 {
+            return Err(Error::NotFound("deployment".into()));
+        }
+        self.get_deployment(id)
             .await?
             .ok_or_else(|| Error::NotFound("deployment".into()))
     }
@@ -1390,8 +1451,8 @@ impl Store for PostgresStore {
         let provider = self.ensure_provider(&dep.provider_name).await?;
         // Mirrors `deployments_identity_uq`. Every column is NOT NULL now that
         // api_base has moved to the provider, so this needs no COALESCE.
-        let exists = sqlx::query(
-            "SELECT 1 FROM deployments WHERE model_id = $1 AND provider_id = $2 \
+        let existing = sqlx::query(
+            "SELECT id FROM deployments WHERE model_id = $1 AND provider_id = $2 \
              AND upstream_model = $3 AND deleted_at IS NULL",
         )
         .bind(&model.id)
@@ -1400,7 +1461,11 @@ impl Store for PostgresStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(storage_err)?;
-        if exists.is_some() {
+        if let Some(row) = existing {
+            if let Some(shapes) = dep.shapes.as_deref() {
+                let id: String = row.get("id");
+                self.set_deployment_shapes(&id, Some(shapes)).await?;
+            }
             return Ok(false);
         }
         self.create_deployment(dep).await?;
